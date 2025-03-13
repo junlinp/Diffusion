@@ -16,33 +16,30 @@ from IPython.display import HTML
 import tqdm
 import cv2
 import einops
+from cifar_dataloader import CifarDataset
 
-dataroot = "~/Downloads/img_align_celeba"
-image_size = 64
-dataset = dset.ImageFolder(root=dataroot,
-                           transform=transforms.Compose([
-                               transforms.Resize(image_size),
-                               transforms.CenterCrop(image_size),
-                               transforms.ToTensor(),
-                               transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-                           ]))
-dataloader = torch.utils.data.DataLoader(dataset, batch_size=128, shuffle=True)
-device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0) else "cpu")
-device = torch.device("mps" if (torch.backends.mps.is_available()) else "cpu")
+image_size = 32
+dataset = CifarDataset(train=False)
+
+dataloader = torch.utils.data.DataLoader(dataset, batch_size=512, shuffle=True)
+device = torch.device("cuda:0" if torch.cuda.is_available()  else "cpu")
+device = torch.device("mps") if (torch.backends.mps.is_available()) else device
+
 print(f"Device: {device}")
 from diffusion_model import VAE, DDPM
 
 
-model = DDPM(img_width=64, img_height=64, img_channel=3)
+model = DDPM(img_width=image_size, img_height=image_size, img_channel=3)
+
 model.to(device)
 opt = optim.Adam(model.parameters())
 
-for epoch in range(128):
+for epoch in range(1024):
     mean_loss = 0 
 
     for batch in tqdm.tqdm(dataloader):
         x, y = batch
-        x = x.to(device)
+        x = x.to(device).to(torch.float32)
         # print(f"x.shape {x.shape}")
         loss = model.compute_loss(x)
         mean_loss += loss

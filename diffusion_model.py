@@ -98,6 +98,59 @@ class VAE(nn.Module):
             w=self.img_width,
         )
 
+
+class SmallStem(torch.nn.Module):
+    """Passes the image through a few light-weight convolutional layers,
+    before patchifying the image. Empirically useful for many computer vision tasks.
+
+    See Xiao et al: Early Convolutions Help Transformers See Better
+    """
+    def __init__(self, patch_size:int, output_features:int):
+        super(SmallStem, self).__init__()
+        self.patch_size = patch_size
+        self.output_features = output_features
+        self.model = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 32, 3, 2, 1),
+            torch.nn.BatchNorm2d(32),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(32, 96, 3, 2, 1),
+            torch.nn.BatchNorm2d(96),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(96, 192, 3, 2, 1),
+            torch.nn.BatchNorm2d(192),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(192, 384, 3, 2, 1),
+            torch.nn.BatchNorm2d(384),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(384, self.output_features, self.patch_size // 16, self.patch_size // 16, "valid")
+        )
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.model(observations)
+
+
+class ErrorGradient(torch.nn.Module):
+    def __init__(self, action_embed_dim:int, time_embed_dim:int, hidden_dim:int):
+        super(ErrorGradient, self).__init__()
+        self.action_project = torch.nn.Linear(action_embed_dim, hidden_dim)
+        self.time_project = torch.nn.Linear(time_embed_dim, hidden_dim)
+        #self.model = torch.nn.Transformer(d_model = hidden_dim)
+
+        self.model = torch.nn.Linear(hidden_dim * 2, time_embed_dim + action_embed_dim)
+        self.final_project = torch.nn.Linear(time_embed_dim + action_embed_dim, action_embed_dim)
+
+    def forward(self, action_embed:torch.Tensor,time_embed:torch.Tensor) -> torch.Tensor:
+        #print(f"action_embed {action_embed.shape}")
+        #print(f"time_embed {time_embed.shape}")
+        action_time_embed = torch.concat([self.action_project(action_embed), self.time_project(time_embed)], axis = -1)
+        #output = self.model.forward(action_time_embed)
+        #print(f"shape {action_time_embed.shape}")
+        output = self.model(action_time_embed)
+        return self.final_project(output)
+        
+
+
+
 class DDPM(nn.Module):
     def __init__(self, img_width, img_height, img_channel):
         super(DDPM, self).__init__()
@@ -107,11 +160,17 @@ class DDPM(nn.Module):
         self.img_channel = img_channel
         self.time_step = 10
         self.alpha = nn.Parameter(torch.tensor(0.97, requires_grad=False))
+        self.gamma = nn.Parameter(torch.tensor(0.97), requires_grad=False)
 
         self.denoising = nn.Linear(self.img_channel * self.img_height * self.img_width, self.img_channel * self.img_height * self.img_width)
-        self.error_gradient = nn.Linear(self.img_channel * self.img_height * self.img_width, self.img_channel * self.img_height * self.img_width)
+        #self.error_gradient = nn.Linear(self.img_channel * self.img_height * self.img_width, self.img_channel * self.img_height * self.img_width)
+        self.error_gradient = ErrorGradient( self.img_channel * self.img_height * self.img_width, 1, 512)
+        self.visual_encoder = SmallStem(patch_size=16, output_features=512)
 
     def compute_loss(self, x:torch.Tensor) -> torch.Tensor:
+
+        visual_embedding = self.visual_encoder.forward(x)
+
         x = einops.rearrange(
             x,
             "batch c h w -> batch (c h w)",
@@ -120,28 +179,27 @@ class DDPM(nn.Module):
             w=self.img_width,
         )
         batch = x.size(0)
-        timestamp = torch.linspace(0, self.time_step - 1, 1)
-        timestamp = einops.repeat(timestamp, "scalar -> batch scalar", batch = batch, scalar = 1)
-        alpha = self.alpha ** timestamp.to(x.device)
-        sample_noise = torch.normal(mean = torch.zeros(x.shape), std = torch.ones(x.shape)).to(x.device)
 
-        sample = torch.sqrt(alpha) * x + torch.sqrt(1 - alpha) * sample_noise
+        # assume timestamp range from [0, 1)
+        timestamp = torch.rand((batch, 1), device=x.device)
 
-        return torch.mean(self.error_gradient(sample) - sample_noise)**2
+        #alpha = self.alpha ** timestamp.to(x.device)
+        sample_noise = torch.randn(x.shape, device=x.device)
+
+        gradient = self.alpha * (x + self.gamma * self.error_gradient.forward(x + sample_noise, timestamp)) 
+
+        return torch.mean((gradient - sample_noise)**2)
 
     def inference(self, sample_size:int) -> torch.Tensor:
 
-        x_t = torch.normal(mean = torch.zeros((sample_size, self.img_width * self.img_height * self.img_channel))).to(self.alpha.device)
+        x_t = torch.randn((sample_size, self.img_width * self.img_height * self.img_channel), device = self.alpha.device)
 
         for t in range(self.time_step, 0, -1):
-            noise = torch.normal(mean = torch.zeros((sample_size, self.img_width * self.img_height * self.img_channel))).to(self.alpha.device)
-            x_t = (
-                self.alpha**-0.5 * (x_t - (1 - self.alpha) / (1 - self.alpha**t) * self.error_gradient(x_t))
-                + (1 - self.alpha)
-                * torch.sqrt(self.alpha ** (t - 1))
-                / ((1 - self.alpha**t))
-                * noise
-            )
+
+            timestamp = torch.tensor([t / self.time_step], device=self.alpha.device)
+            timestamp = einops.repeat(timestamp, "one -> batch one", batch = sample_size)
+            #noise = torch.randn((sample_size, self.img_width * self.img_height * self.img_channel)).to(self.alpha.device)
+            x_t = self.alpha * (x_t - self.gamma * self.error_gradient.forward(x_t, timestamp))
 
         return einops.rearrange(
             x_t,
