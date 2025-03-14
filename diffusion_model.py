@@ -158,7 +158,8 @@ class DDPM(nn.Module):
         self.img_width = img_width
         self.img_height = img_height
         self.img_channel = img_channel
-        self.time_step = 10
+        self.time_step = 1000
+        self.sample_size = 2
         self.alpha = nn.Parameter(torch.tensor(0.97, requires_grad=False))
         self.gamma = nn.Parameter(torch.tensor(0.97), requires_grad=False)
 
@@ -166,6 +167,18 @@ class DDPM(nn.Module):
         #self.error_gradient = nn.Linear(self.img_channel * self.img_height * self.img_width, self.img_channel * self.img_height * self.img_width)
         self.error_gradient = ErrorGradient( self.img_channel * self.img_height * self.img_width, 1, 512)
         self.visual_encoder = SmallStem(patch_size=16, output_features=512)
+
+        self.beta_0 = 1e-4
+        self.beta_t = 0.02
+        self.alpha_buffer = [1.0 - (i / self.time_step * (self.beta_t - self.beta_0) + self.beta_0) for i in range(self.time_step)]
+
+        base = 1.0
+        self.alpha_cumsum_buffer = []
+        for alpha in self.alpha_buffer:
+            self.alpha_cumsum_buffer.append(base * alpha)
+            base = base * alpha
+
+        self.alpha_cumsum_buffer = nn.Parameter(torch.tensor(self.alpha_cumsum_buffer, requires_grad=False))
 
     def compute_loss(self, x:torch.Tensor) -> torch.Tensor:
 
@@ -178,17 +191,24 @@ class DDPM(nn.Module):
             h=self.img_height,
             w=self.img_width,
         )
+        x = einops.repeat(x, "batch features -> batch sample_size features", sample_size = self.sample_size)
         batch = x.size(0)
 
-        # assume timestamp range from [0, 1)
-        timestamp = torch.rand((batch, 1), device=x.device)
-
+        # assume timestamp range from [0, time_step)
+        timestamp = (torch.rand((batch, self.sample_size, 1), device=x.device) * self.sample_size).to(torch.int32)
+        alpha_cumsum = self.alpha_cumsum_buffer[timestamp]
+        print(f"timestamp : {timestamp}")
+        print(f"alpha_cumsum : {alpha_cumsum}")
+        print(f"self.alpha_cumsum_buffer {self.alpha_cumsum_buffer}")
         #alpha = self.alpha ** timestamp.to(x.device)
         sample_noise = torch.randn(x.shape, device=x.device)
 
-        gradient = self.alpha * (x + self.gamma * self.error_gradient.forward(x + sample_noise, timestamp)) 
+        gradient = self.error_gradient.forward(torch.sqrt(alpha_cumsum) * x + torch.sqrt(1 - alpha_cumsum) * sample_noise, timestamp.to(torch.float32))
 
         return torch.mean((gradient - sample_noise)**2)
+
+    def get_alpha(self, timestamp: torch.Tensor)->torch.Tensor:
+        return self.beta_0 + (self.beta_t - self.beta_0) * timestamp
 
     def inference(self, sample_size:int) -> torch.Tensor:
 
