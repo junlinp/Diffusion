@@ -32,28 +32,30 @@ from diffusion_model import VAE, DDPM
 model = DDPM(img_width=image_size, img_height=image_size, img_channel=3)
 
 model.to(device)
-opt = optim.Adam(model.parameters())
+opt = optim.Adam(model.parameters(),lr=2 * 1e-4)
 
 for epoch in range(1024):
     mean_loss = 0 
-
+    model.train()
     for batch in tqdm.tqdm(dataloader):
         x, y = batch
-        x = x.to(device).to(torch.float32)
+        x = x.to(torch.float32).to(device)
         # print(f"x.shape {x.shape}")
         loss = model.compute_loss(x)
-        mean_loss += loss
+        mean_loss += loss.item()
         opt.zero_grad()
         loss.backward()
         opt.step()
     print(f"Epoch {epoch} loss : {mean_loss / len(dataset)}")
 
     sample_size = 16
-    inference_result = model.inference(sample_size = sample_size)
+    model.eval()
+    inference_result = model.inference(sample_size = sample_size, device=device)
     # print(f"inference_result: {inference_result.shape}")
     inference_result = einops.rearrange(
         inference_result, "(h1 w1) c h w -> (h h1) (w w1) c", h1=4, w1=4
     )
+    print(f"first element {inference_result[0, 0, 0]}")
     cv2.imwrite(f"outputs/{epoch}.png", (inference_result.cpu().detach().numpy() * 0.5 + 0.5) * 255)
 
 

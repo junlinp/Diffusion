@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 import einops
+import math
+from accelerate import Accelerator
 
 class VAE(nn.Module):
 
@@ -128,25 +130,82 @@ class SmallStem(torch.nn.Module):
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.model(observations)
 
+class FeedForward(torch.nn.Module):
+    def __init__(self, feature_num:int, dropout:int = 0.1):
+        super(FeedForward, self).__init__()
+
+        self.first_project = nn.Linear(feature_num, 2 * feature_num)
+        self.activation = nn.SiLU()
+        self.dropoutp = nn.Dropout(dropout)
+        self.final_project = nn.Linear(2 * feature_num, feature_num)
+
+    def forward(self, x:torch.Tensor)->torch.Tensor:
+        input = x
+        x = self.first_project(x)
+        x = self.activation(x)
+        x = self.dropoutp(x)
+        x = self.final_project(x)
+        return x + input
+
+
+class MultipleHeadAttention(torch.nn.Module):
+    def __init__(self, d_model:int, n_head:int):
+        super(MultipleHeadAttention, self).__init__()
+        self.total_hidden_dim = 512
+        assert self.total_hidden_dim % n_head == 0
+        self.n_head = n_head
+        self.d_head = self.total_hidden_dim // self.n_head
+        self.q_w = torch.nn.Linear(d_model, self.total_hidden_dim)
+        self.k_w = torch.nn.Linear(d_model, self.total_hidden_dim) 
+        self.v_w = torch.nn.Linear(d_model, self.total_hidden_dim) 
+        self.layer_norm = torch.nn.LayerNorm(self.total_hidden_dim)
+
+        self.feedforward = FeedForward(self.total_hidden_dim)
+        self.final_project = nn.Linear(self.total_hidden_dim, d_model)
+
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        q = self.q_w(x)
+        k = self.k_w(x)
+        v = self.v_w(x)
+
+        q = einops.rearrange(q, "batch seq (head_num head_dim) -> batch seq head_num head_dim", head_num = self.n_head, head_dim = self.d_head)
+        k = einops.rearrange(k, "batch seq (head_num head_dim) -> batch seq head_num head_dim", head_num = self.n_head, head_dim = self.d_head)
+        v = einops.rearrange(v, "batch seq (head_num head_dim) -> batch seq head_num head_dim", head_num = self.n_head, head_dim = self.d_head)
+
+        attention = einops.einsum(q, k, "batch seq1 head_num head_dim, batch seq2 head_num head_dim -> batch head_num seq1 seq2") / math.sqrt(self.d_head)
+        attention = torch.softmax(attention, -1)
+
+        o = einops.einsum(attention, v, "batch head_num seq1 seq2, batch seq2 head_num head_dim->batch seq1 head_num head_dim")
+        o = einops.rearrange(o, "batch seq head_num head_dim -> batch seq (head_num head_dim)")
+        o = self.layer_norm(o)
+
+        return x + self.final_project(self.feedforward.forward(o))
+
+
+
+class Transformer(torch.nn.Module):
+    def __init__(self, input_feature_dim:int, d_model:int, block_num:int):
+        super(Transformer, self).__init__()
+
+        self.model = torch.nn.ModuleList([MultipleHeadAttention(d_model, 8) for i in range(block_num)])
+        self.layer_norm = torch.nn.LayerNorm(input_feature_dim) 
+
+    def forward(self, x:torch.Tensor)->torch.Tensor:
+        for lyr in self.model:
+            x = lyr.forward(x)
+        return x
 
 class ErrorGradient(torch.nn.Module):
     def __init__(self, action_embed_dim:int, time_embed_dim:int, hidden_dim:int):
         super(ErrorGradient, self).__init__()
-        self.action_project = torch.nn.Linear(action_embed_dim, hidden_dim)
-        self.time_project = torch.nn.Linear(time_embed_dim, hidden_dim)
-        #self.model = torch.nn.Transformer(d_model = hidden_dim)
-
-        self.model = torch.nn.Linear(hidden_dim * 2, time_embed_dim + action_embed_dim)
-        self.final_project = torch.nn.Linear(time_embed_dim + action_embed_dim, action_embed_dim)
+        self.time_project = torch.nn.Linear(time_embed_dim, action_embed_dim)
+        self.model = Transformer(action_embed_dim, action_embed_dim, 4)
+        self.layer_norm = torch.nn.LayerNorm(action_embed_dim)
 
     def forward(self, action_embed:torch.Tensor,time_embed:torch.Tensor) -> torch.Tensor:
-        #print(f"action_embed {action_embed.shape}")
-        #print(f"time_embed {time_embed.shape}")
-        action_time_embed = torch.concat([self.action_project(action_embed), self.time_project(time_embed)], axis = -1)
-        #output = self.model.forward(action_time_embed)
-        #print(f"shape {action_time_embed.shape}")
+        action_time_embed = action_embed + self.time_project(time_embed)
         output = self.model(action_time_embed)
-        return self.final_project(output)
+        return self.layer_norm(output + action_time_embed)
         
 
 
@@ -158,32 +217,24 @@ class DDPM(nn.Module):
         self.img_width = img_width
         self.img_height = img_height
         self.img_channel = img_channel
-        self.time_step = 1000
-        self.sample_size = 2
-        self.alpha = nn.Parameter(torch.tensor(0.97, requires_grad=False))
-        self.gamma = nn.Parameter(torch.tensor(0.97), requires_grad=False)
+        self.time_step = 1024
+        self.sample_size = 64
 
-        self.denoising = nn.Linear(self.img_channel * self.img_height * self.img_width, self.img_channel * self.img_height * self.img_width)
+        #self.denoising = nn.Linear(self.img_channel * self.img_height * self.img_width, self.img_channel * self.img_height * self.img_width)
         #self.error_gradient = nn.Linear(self.img_channel * self.img_height * self.img_width, self.img_channel * self.img_height * self.img_width)
         self.error_gradient = ErrorGradient( self.img_channel * self.img_height * self.img_width, 1, 512)
-        self.visual_encoder = SmallStem(patch_size=16, output_features=512)
+        #self.visual_encoder = SmallStem(patch_size=16, output_features=512)
 
         self.beta_0 = 1e-4
         self.beta_t = 0.02
         self.alpha_buffer = [1.0 - (i / self.time_step * (self.beta_t - self.beta_0) + self.beta_0) for i in range(self.time_step)]
-
         base = 1.0
         self.alpha_cumsum_buffer = []
         for alpha in self.alpha_buffer:
             self.alpha_cumsum_buffer.append(base * alpha)
             base = base * alpha
 
-        self.alpha_cumsum_buffer = nn.Parameter(torch.tensor(self.alpha_cumsum_buffer, requires_grad=False))
-
     def compute_loss(self, x:torch.Tensor) -> torch.Tensor:
-
-        visual_embedding = self.visual_encoder.forward(x)
-
         x = einops.rearrange(
             x,
             "batch c h w -> batch (c h w)",
@@ -194,37 +245,30 @@ class DDPM(nn.Module):
         x = einops.repeat(x, "batch features -> batch sample_size features", sample_size = self.sample_size)
         batch = x.size(0)
 
-        # assume timestamp range from [0, time_step)
         timestamp = (torch.rand((batch, self.sample_size, 1), device=x.device) * self.sample_size).to(torch.int32)
-        alpha_cumsum = self.alpha_cumsum_buffer[timestamp]
-        print(f"timestamp : {timestamp}")
-        print(f"alpha_cumsum : {alpha_cumsum}")
-        print(f"self.alpha_cumsum_buffer {self.alpha_cumsum_buffer}")
-        #alpha = self.alpha ** timestamp.to(x.device)
+        alpha_cumsum = torch.tensor(self.alpha_cumsum_buffer,device=x.device)[timestamp]
         sample_noise = torch.randn(x.shape, device=x.device)
-
         gradient = self.error_gradient.forward(torch.sqrt(alpha_cumsum) * x + torch.sqrt(1 - alpha_cumsum) * sample_noise, timestamp.to(torch.float32))
+        return torch.mean(einops.reduce(torch.abs(gradient - sample_noise), "batch sample features -> batch sample", "sum"))
 
-        return torch.mean((gradient - sample_noise)**2)
+    def inference(self, sample_size:int, device:torch.device) -> torch.Tensor:
 
-    def get_alpha(self, timestamp: torch.Tensor)->torch.Tensor:
-        return self.beta_0 + (self.beta_t - self.beta_0) * timestamp
+        x_t = torch.randn((1, sample_size, self.img_width * self.img_height * self.img_channel), device = device)
 
-    def inference(self, sample_size:int) -> torch.Tensor:
+        for T in range(self.time_step - 1, 0, -1):
+            alpha = self.alpha_buffer[T]
+            beta = 1 - alpha
+            alpha_cum = self.alpha_cumsum_buffer[T]
 
-        x_t = torch.randn((sample_size, self.img_width * self.img_height * self.img_channel), device = self.alpha.device)
-
-        for t in range(self.time_step, 0, -1):
-
-            timestamp = torch.tensor([t / self.time_step], device=self.alpha.device)
-            timestamp = einops.repeat(timestamp, "one -> batch one", batch = sample_size)
-            #noise = torch.randn((sample_size, self.img_width * self.img_height * self.img_channel)).to(self.alpha.device)
-            x_t = self.alpha * (x_t - self.gamma * self.error_gradient.forward(x_t, timestamp))
+            timestamp = torch.tensor([T], device=device, dtype = torch.float32)
+            timestamp = einops.repeat(timestamp, "one -> batch sample one", batch = 1, sample = sample_size)
+            noise = torch.randn((sample_size, self.img_width * self.img_height * self.img_channel)).to(device)
+            x_t = alpha**-0.5 * (x_t - (1 - alpha) * (1 - alpha_cum)**-0.5 * self.error_gradient.forward(x_t, timestamp)) + beta**0.5 * noise
 
         return einops.rearrange(
             x_t,
-            "batch (c h w) -> batch c h w",
-            batch=sample_size,
+            "batch sample (c h w) -> (batch sample) c h w",
+            sample=sample_size,
             c=self.img_channel,
             h=self.img_height,
             w=self.img_width,
